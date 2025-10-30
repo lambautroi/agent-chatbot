@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Body
+from fastapi import APIRouter, Depends, HTTPException, Request, Body, WebSocket
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List
@@ -6,8 +6,11 @@ from app.db import models
 from app.db.database import get_db
 from app.core.security import get_current_user
 from app.services.llm_service import call_gpt
+from app.websocket.manager import ConnectionManager
+import json
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+manager = ConnectionManager()
 
 # 1️⃣ Lấy danh sách hội thoại đang hoạt động
 @router.get("/conversations")
@@ -116,3 +119,40 @@ def chat_with_bot(request: Request, message: str, db: Session = Depends(get_db))
     db.add_all([msg, reply_msg])
     db.commit()
     return {"reply": reply}
+
+@router.websocket("/{conversation_id}")
+async def websocket_endpoint(websocket: WebSocket, conversation_id: int, db: Session = Depends(get_db)):
+    await manager.connect(conversation_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+
+            # Validate message
+            sender = msg.get("sender", "agent")
+            content = msg.get("content", "")
+
+            if not content.strip():
+                continue
+
+            # Save to DB
+            chat_message = models.ChatMessage(
+                conversation_id=conversation_id,
+                sender_role=models.SenderRole(sender),
+                content=content,
+                created_at=datetime.utcnow()
+            )
+            db.add(chat_message)
+            db.commit()
+
+            # Broadcast message to all clients in same conversation
+            await manager.broadcast(conversation_id, {
+                "sender": sender,
+                "content": content,
+                "timestamp": chat_message.created_at.isoformat()
+            })
+
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        manager.disconnect(conversation_id, websocket)
